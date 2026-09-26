@@ -15,6 +15,10 @@ OpType = Literal["receive", "transfer", "delivery", "adjustment"]
 OpStatus = Literal["draft", "waiting", "ready", "done", "canceled"]
 Role = Literal["staff", "manager"]
 Qty = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=3)]
+Money = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=2)]
+# No '/': short codes are joined with '/' into references like WH/IN/0001.
+ShortCode = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20, pattern=r"^[A-Za-z0-9_.-]+$")]
+Text = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]
 
 
 # --- auth ---
@@ -55,22 +59,28 @@ class MessageOut(BaseModel):
 
 class WarehouseIn(BaseModel):
     name: Name
+    short_code: ShortCode
+    address: Text | None = None
 
 
 class WarehouseOut(BaseModel):
     id: int
     name: str
+    short_code: str
+    address: str | None
 
 
 class LocationIn(BaseModel):
     warehouse_id: int
     name: Name
+    short_code: ShortCode
 
 
 class LocationOut(BaseModel):
     id: int
     warehouse_id: int
     name: str
+    short_code: str
 
 
 Sku = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
@@ -83,14 +93,9 @@ class ProductIn(BaseModel):
     category: Name
     uom: Uom = "Units"
     min_qty: Qty = Decimal(0)
+    unit_cost: Money = Decimal(0)
     initial_qty: Qty = Decimal(0)
     initial_location_id: int | None = None
-
-    @model_validator(mode="after")
-    def _initial_stock_needs_location(self):
-        if self.initial_qty > 0 and self.initial_location_id is None:
-            raise ValueError("initial_location_id is required when initial_qty > 0")
-        return self
 
 
 class ProductPatch(BaseModel):
@@ -99,6 +104,7 @@ class ProductPatch(BaseModel):
     category: Name | None = None
     uom: Uom | None = None
     min_qty: Qty | None = None
+    unit_cost: Money | None = None
 
 
 class ProductOut(BaseModel):
@@ -108,6 +114,7 @@ class ProductOut(BaseModel):
     category: str
     uom: str
     min_qty: float
+    unit_cost: float
 
 
 class QuantOut(BaseModel):
@@ -119,42 +126,76 @@ class QuantOut(BaseModel):
     location_id: int
     location_name: str
     warehouse_id: int
+    unit_cost: float
     qty: float
+    free_qty: float  # qty minus what open deliveries/transfers from this location will take; < 0 means over-promised
 
 
 # --- operations ---
 
-class OperationIn(BaseModel):
-    type: OpType
+class LineIn(BaseModel):
     product_id: int
     qty: Qty  # adjustment: the physically counted quantity (0 allowed); otherwise the quantity moved
+
+
+class OperationIn(BaseModel):
+    type: OpType
+    lines: Annotated[list[LineIn], Field(min_length=1, max_length=200)]
     source_location_id: int | None = None
     dest_location_id: int | None = None
     scheduled_date: date | None = None
     partner: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] | None = None
-    note: Annotated[str, StringConstraints(max_length=500)] | None = None
+    delivery_address: Text | None = None
+    note: Text | None = None
 
     @model_validator(mode="after")
-    def _qty_positive_unless_count(self):
-        if self.qty == 0 and self.type != "adjustment":
+    def _check_lines(self):
+        if self.type != "adjustment" and any(line.qty == 0 for line in self.lines):
             raise ValueError("qty must be greater than 0")
         return self
 
 
+class LineOut(BaseModel):
+    product_id: int
+    sku: str
+    product_name: str
+    uom: str
+    qty: float
+
+
 class OperationOut(BaseModel):
     id: int
+    reference: str
     type: OpType
     status: OpStatus
-    product_id: int
-    qty: float
+    lines: list[LineOut]
     source_location_id: int | None
     dest_location_id: int | None
     warehouse_id: int
     scheduled_date: date
     partner: str | None
+    delivery_address: str | None
     note: str | None
     created_by: int
+    responsible: str  # login_id of created_by
     created_at: datetime
+
+
+class MoveOut(BaseModel):
+    """One product line of an operation, flattened for Move History."""
+    operation_id: int
+    reference: str
+    type: OpType  # frontend: receive = in (green), delivery = out (red)
+    status: OpStatus
+    scheduled_date: date
+    partner: str | None
+    product_id: int
+    sku: str
+    product_name: str
+    uom: str
+    qty: float  # adjustment: the counted quantity; the ledger holds the resulting delta
+    from_location: str | None  # receipts: the supplier
+    to_location: str | None    # deliveries: the customer
 
 
 class TransitionIn(BaseModel):
@@ -195,11 +236,19 @@ class StockAlert(BaseModel):
     min_qty: float
 
 
+class OpCounts(BaseModel):
+    open: int = 0      # not done or canceled
+    ready: int = 0     # "4 to receive / to deliver"
+    waiting: int = 0
+    late: int = 0      # open and scheduled_date < today
+    upcoming: int = 0  # open and scheduled_date > today
+
+
 class DashboardOut(BaseModel):
     products_in_stock: int
     low_stock: int      # 0 < on_hand <= min_qty
     out_of_stock: int   # on_hand == 0
-    pending_receipts: int
-    pending_deliveries: int
-    scheduled_transfers: int
+    receipts: OpCounts
+    deliveries: OpCounts
+    transfers: OpCounts
     alerts: list[StockAlert]  # every low or out-of-stock product

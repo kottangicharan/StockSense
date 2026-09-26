@@ -10,6 +10,7 @@ import psycopg  # noqa: E402
 import pytest  # noqa: E402
 
 from app import auth, db  # noqa: E402
+from app.schemas import OperationIn  # noqa: E402
 
 
 def _create_test_database() -> None:
@@ -46,9 +47,9 @@ def world():
                       auth.ph.hash("manager-pass-1"))
         staff = ins("INSERT INTO users (login_id, email, password_hash) VALUES ('sam', 'sam@t.io', %s)",
                     auth.ph.hash("staff-pass-1"))
-        wh = ins("INSERT INTO warehouses (name) VALUES ('Main')")
-        stock = ins("INSERT INTO locations (warehouse_id, name) VALUES (%s, 'WH/Stock')", wh)
-        rack = ins("INSERT INTO locations (warehouse_id, name) VALUES (%s, 'WH/Production Rack')", wh)
+        wh = ins("INSERT INTO warehouses (name, short_code) VALUES ('Main', 'WH')")
+        stock = ins("INSERT INTO locations (warehouse_id, name, short_code) VALUES (%s, 'WH/Stock', 'STOCK')", wh)
+        rack = ins("INSERT INTO locations (warehouse_id, name, short_code) VALUES (%s, 'WH/Production Rack', 'RACK')", wh)
         steel = ins("INSERT INTO products (sku, name, category) VALUES ('STEEL', 'Steel', 'Raw Material')")
     return {
         "manager": {"id": manager, "role": "manager"},
@@ -72,3 +73,8 @@ def assert_quants_match_ledger() -> None:
             "GROUP BY q.product_id, q.location_id, q.qty HAVING q.qty <> COALESCE(SUM(l.delta), 0)"
         ).fetchall()
     assert drift == [], f"quants drifted from ledger: {drift}"
+
+
+def op_in(product_id: int, qty, **fields) -> OperationIn:
+    """Single-line operation, the common case in tests."""
+    return OperationIn(lines=[{"product_id": product_id, "qty": qty}], **fields)

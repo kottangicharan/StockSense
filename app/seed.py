@@ -20,20 +20,23 @@ def seed() -> None:
                       "manager", "manager@demo.local", ph.hash(MANAGER_PW))
         ins("INSERT INTO users (login_id, email, password_hash, role) VALUES (%s, %s, %s, 'staff')",
             "staff", "staff@demo.local", ph.hash(STAFF_PW))
-        main_wh = ins("INSERT INTO warehouses (name) VALUES (%s)", "Main Warehouse")
-        second_wh = ins("INSERT INTO warehouses (name) VALUES (%s)", "Secondary Warehouse")
-        stock = ins("INSERT INTO locations (warehouse_id, name) VALUES (%s, %s)", main_wh, "WH/Stock")
-        rack = ins("INSERT INTO locations (warehouse_id, name) VALUES (%s, %s)", main_wh, "WH/Production Rack")
-        ins("INSERT INTO locations (warehouse_id, name) VALUES (%s, %s)", second_wh, "WH2/Stock")
-        product = "INSERT INTO products (sku, name, category, uom, min_qty) VALUES (%s, %s, %s, %s, %s)"
-        steel = ins(product, "STEEL-001", "Steel Rod", "Raw Material", "kg", 100)  # 77 on hand -> low-stock alert
-        bolts = ins(product, "BOLT-M8", "M8 Bolt", "Hardware", "Units", 50)
-        ins(product, "PAINT-RED", "Red Paint", "Consumable", "L", 10)  # never received -> out of stock
+        warehouse = "INSERT INTO warehouses (name, short_code, address) VALUES (%s, %s, %s)"
+        main_wh = ins(warehouse, "Main Warehouse", "WH", "12 Industrial Estate")
+        second_wh = ins(warehouse, "Secondary Warehouse", "WH2", None)
+        location = "INSERT INTO locations (warehouse_id, name, short_code) VALUES (%s, %s, %s)"
+        stock = ins(location, main_wh, "WH/Stock", "STOCK")
+        rack = ins(location, main_wh, "WH/Production Rack", "RACK")
+        ins(location, second_wh, "WH2/Stock", "STOCK")
+        product = "INSERT INTO products (sku, name, category, uom, min_qty, unit_cost) VALUES (%s, %s, %s, %s, %s, %s)"
+        steel = ins(product, "STEEL-001", "Steel Rod", "Raw Material", "kg", 100, 60)  # 77 on hand -> low-stock alert
+        bolts = ins(product, "BOLT-M8", "M8 Bolt", "Hardware", "Units", 50, 2.5)
+        ins(product, "PAINT-RED", "Red Paint", "Consumable", "L", 10, 450)  # never received -> out of stock
 
     actor = {"id": manager, "role": "manager"}
 
-    def op(type_: str, product: int, qty: int, until: str, **locs) -> None:
-        o, _ = create_operation(OperationIn(type=type_, product_id=product, qty=qty, **locs), actor)
+    def op(type_: str, lines: dict[int, int], until: str, **fields) -> None:
+        o, _ = create_operation(OperationIn(
+            type=type_, lines=[{"product_id": p, "qty": q} for p, q in lines.items()], **fields), actor)
         status = "draft"
         for nxt in ("waiting", "ready", "done"):
             if status == until:
@@ -42,15 +45,16 @@ def seed() -> None:
             status = nxt
 
     # The spec's worked example, fully validated: steel ends at 77 on the production rack.
-    op("receive", steel, 100, "done", dest_location_id=stock)
-    op("transfer", steel, 100, "done", source_location_id=stock, dest_location_id=rack)
-    op("delivery", steel, 20, "done", source_location_id=rack)
-    op("adjustment", steel, 77, "done", source_location_id=rack)  # counted 77: 3 damaged
-    # Something in every kanban column.
-    op("receive", bolts, 500, "done", dest_location_id=stock)
-    op("delivery", bolts, 50, "ready", source_location_id=stock)
-    op("transfer", bolts, 100, "waiting", source_location_id=stock, dest_location_id=rack)
-    op("receive", steel, 250, "draft", dest_location_id=stock, partner="Acme Steel")
+    op("receive", {steel: 100}, "done", dest_location_id=stock, partner="Acme Steel")
+    op("transfer", {steel: 100}, "done", source_location_id=stock, dest_location_id=rack)
+    op("delivery", {steel: 20}, "done", source_location_id=rack, partner="Azure Interior")
+    op("adjustment", {steel: 77}, "done", source_location_id=rack, note="3 kg damaged")  # counted 77
+    # Something in every kanban column; multi-line receipt and delivery.
+    op("receive", {bolts: 500}, "done", dest_location_id=stock, partner="Fasteners Co")
+    op("delivery", {bolts: 50, steel: 10}, "ready", source_location_id=rack, partner="Azure Interior",
+       delivery_address="4 Market Road")
+    op("transfer", {bolts: 100}, "waiting", source_location_id=stock, dest_location_id=rack)
+    op("receive", {steel: 250, bolts: 200}, "draft", dest_location_id=stock, partner="Acme Steel")
     print(f"Seeded. Logins: manager / {MANAGER_PW}   staff / {STAFF_PW}")
 
 

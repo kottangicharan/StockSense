@@ -72,7 +72,7 @@ def test_otp_request_rate_limited(client):
 def test_rbac_is_server_side(client, world):
     login(client, "sam", "staff-pass-1")
     assert client.post("/products", json={"sku": "X", "name": "X", "category": "Y"}).status_code == 403
-    r = client.post("/operations", json={"type": "adjustment", "product_id": world["steel"], "qty": 1,
+    r = client.post("/operations", json={"type": "adjustment", "lines": [{"product_id": world["steel"], "qty": 1}],
                                          "source_location_id": world["stock"], "role": "manager"})
     assert r.status_code == 403
     assert client.get("/ledger").status_code == 403
@@ -80,15 +80,15 @@ def test_rbac_is_server_side(client, world):
 
 def test_cross_site_write_blocked(client, world):
     login(client, "boss", "manager-pass-1")
-    r = client.post("/warehouses", json={"name": "Evil"}, headers={"origin": "https://evil.example"})
+    r = client.post("/warehouses", json={"name": "Evil", "short_code": "EV"}, headers={"origin": "https://evil.example"})
     assert r.status_code == 403
-    r = client.post("/warehouses", json={"name": "Good"}, headers={"origin": "http://localhost:3000"})
+    r = client.post("/warehouses", json={"name": "Good", "short_code": "GD"}, headers={"origin": "http://localhost:3000"})
     assert r.status_code == 201
 
 
 def test_transition_idempotency_and_realtime(client, world):
     login(client, "boss", "manager-pass-1")
-    op = client.post("/operations", json={"type": "receive", "product_id": world["steel"], "qty": 100,
+    op = client.post("/operations", json={"type": "receive", "lines": [{"product_id": world["steel"], "qty": 100}],
                                           "dest_location_id": world["stock"]}).json()
 
     with client.websocket_connect("/ws", headers={"cookie": f"access_token={client.cookies['access_token']}"}) as ws:
@@ -144,18 +144,16 @@ def test_products_dashboard_and_filters(client, world):
     assert client.patch(f"/products/{chair['id']}", json={"min_qty": 5}).json()["min_qty"] == 5.0
     assert client.patch("/products/999999", json={"name": "Nope"}).status_code == 404
 
-    client.post("/operations", json={"type": "receive", "product_id": world["steel"], "qty": 5,
+    client.post("/operations", json={"type": "receive", "lines": [{"product_id": world["steel"], "qty": 5}],
                                      "dest_location_id": world["stock"], "partner": "Acme Steel"})
-    d = client.post("/operations", json={"type": "delivery", "product_id": chair["id"], "qty": 2,
+    d = client.post("/operations", json={"type": "delivery", "lines": [{"product_id": chair["id"], "qty": 2}],
                                          "source_location_id": world["stock"]}).json()
     client.post(f"/operations/{d['id']}/transition", json={"from": "draft", "to": "canceled"},
                 headers={"Idempotency-Key": uuid.uuid4().hex})
 
     dash = client.get("/dashboard").json()
-    assert {k: dash[k] for k in ("products_in_stock", "low_stock", "out_of_stock", "pending_receipts",
-                                 "pending_deliveries", "scheduled_transfers")} == {
-        "products_in_stock": 1, "low_stock": 0, "out_of_stock": 1, "pending_receipts": 1,
-        "pending_deliveries": 0, "scheduled_transfers": 0}
+    assert (dash["products_in_stock"], dash["low_stock"], dash["out_of_stock"]) == (1, 0, 1)
+    assert dash["receipts"]["open"] == 1 and dash["deliveries"]["open"] == dash["transfers"]["open"] == 0
     assert [a["sku"] for a in dash["alerts"]] == ["STEEL"]
     assert client.get("/dashboard", params={"category": "Furniture"}).json()["alerts"] == []
 
@@ -164,3 +162,58 @@ def test_products_dashboard_and_filters(client, world):
     assert client.get("/operations", params={"location_id": world["rack"]}).json() == []
     assert client.get("/operations", params={"q": "STE"}).json()[0]["partner"] == "Acme Steel"
     assert [p["sku"] for p in client.get("/products", params={"q": "chai"}).json()] == ["CHAIR-1"]
+
+
+def test_multi_line_receipt_delivery_references_and_moves(client, world):
+    login(client, "boss", "manager-pass-1")
+    stock, steel = world["stock"], world["steel"]
+    desk = client.post("/products", json={"sku": "DESK001", "name": "Desk", "category": "Furniture",
+                                          "unit_cost": 3000}).json()
+    key = lambda: {"Idempotency-Key": uuid.uuid4().hex}  # noqa: E731
+
+    r = client.post("/operations", json={"type": "receive", "dest_location_id": stock, "partner": "Azure Interior",
+                                         "lines": [{"product_id": steel, "qty": 10}, {"product_id": desk["id"], "qty": 6}]})
+    assert r.status_code == 201, r.text
+    receipt = r.json()
+    assert receipt["reference"] == "WH/IN/0001"
+    assert receipt["responsible"] == "boss"
+    assert [(line["sku"], line["qty"]) for line in receipt["lines"]] == [("STEEL", 10.0), ("DESK001", 6.0)]
+    # Receipts skip 'waiting': draft -> ready -> done.
+    client.post(f"/operations/{receipt['id']}/transition", json={"from": "draft", "to": "ready"}, headers=key())
+    r = client.post(f"/operations/{receipt['id']}/transition", json={"from": "ready", "to": "done"}, headers=key())
+    assert r.status_code == 200, r.text
+
+    delivery = client.post("/operations", json={
+        "type": "delivery", "source_location_id": stock, "partner": "Azure Interior", "delivery_address": "4 Market Rd",
+        "scheduled_date": "2000-01-01",  # in the past -> late
+        "lines": [{"product_id": steel, "qty": 4}, {"product_id": desk["id"], "qty": 6}]}).json()
+    assert delivery["reference"] == "WH/OUT/0001"
+    assert client.post("/operations", json={"type": "delivery", "source_location_id": stock, "lines": [
+        {"product_id": steel, "qty": 1}, {"product_id": steel, "qty": 2}]}).status_code == 409  # duplicate product (DB unique)
+
+    # Open delivery reserves stock: on hand stays, free-to-use drops.
+    quants = {q["sku"]: q for q in client.get("/quants", params={"location_id": stock}).json()}
+    assert (quants["DESK001"]["qty"], quants["DESK001"]["free_qty"], quants["DESK001"]["unit_cost"]) == (6.0, 0.0, 3000.0)
+    assert (quants["STEEL"]["qty"], quants["STEEL"]["free_qty"]) == (10.0, 6.0)
+
+    dash = client.get("/dashboard").json()["deliveries"]
+    assert (dash["open"], dash["late"], dash["ready"]) == (1, 1, 0)
+
+    moves = client.get("/moves", params={"q": "WH/OUT"}).json()
+    assert [(m["sku"], m["from_location"], m["to_location"], m["qty"]) for m in moves] == [
+        ("STEEL", "WH/Stock", "Azure Interior", 4.0), ("DESK001", "WH/Stock", "Azure Interior", 6.0)]
+    assert {m["from_location"] for m in client.get("/moves", params={"type": "receive"}).json()} == {"Azure Interior"}
+    assert [o["reference"] for o in client.get("/operations", params={"q": "azure"}).json()] == ["WH/OUT/0001", "WH/IN/0001"]
+
+    # Validating the multi-line delivery posts one ledger row per line, atomically.
+    for frm, to in [("draft", "waiting"), ("waiting", "ready"), ("ready", "done")]:
+        assert client.post(f"/operations/{delivery['id']}/transition", json={"from": frm, "to": to},
+                           headers=key()).status_code == 200
+    detail = client.get(f"/operations/{delivery['id']}").json()
+    assert sorted(entry["delta"] for entry in detail["ledger"]) == [-6.0, -4.0]
+    assert client.get("/quants", params={"location_id": stock, "q": "desk"}).json()[0]["qty"] == 0.0
+
+    # Staff can read Move History (the raw ledger stays manager-only).
+    client.post("/auth/logout")
+    login(client, "sam", "staff-pass-1")
+    assert client.get("/moves").status_code == 200

@@ -2,6 +2,7 @@
 
 Services are plain functions (no HTTP); routes call them and broadcast only after they return (i.e. after commit).
 """
+from collections import defaultdict
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Header, Query
@@ -11,8 +12,9 @@ from . import db
 from .auth import current_user, require_role
 from .db import DomainError
 from .schemas import (
-    DashboardOut, LedgerOut, LocationIn, LocationOut, OperationDetail, OperationIn, OperationOut, OpStatus, OpType,
-    ProductIn, ProductOut, ProductPatch, QuantOut, StockAlert, TransitionIn, WarehouseIn, WarehouseOut,
+    DashboardOut, LedgerOut, LineIn, LocationIn, LocationOut, MoveOut, OpCounts, OperationDetail, OperationIn,
+    OperationOut, OpStatus, OpType, ProductIn, ProductOut, ProductPatch, QuantOut, StockAlert, TransitionIn,
+    WarehouseIn, WarehouseOut,
 )
 from .ws import publish
 
@@ -21,27 +23,32 @@ from .ws import publish
 NEXT: dict[str, str] = {"draft": "waiting", "waiting": "ready", "ready": "done"}
 
 
-def can_transition(frm: str, to: str) -> bool:
-    """Forward-only, one step at a time; any open operation (not done/canceled) can be canceled."""
-    return NEXT.get(frm) == to or (to == "canceled" and frm in NEXT)
+def can_transition(op_type: str, frm: str, to: str) -> bool:
+    """Forward-only, one step at a time; receipts may skip 'waiting'; any open operation can be canceled."""
+    return (NEXT.get(frm) == to or (to == "canceled" and frm in NEXT)
+            or (op_type == "receive" and (frm, to) == ("draft", "ready")))
 
 
-def ledger_deltas(op: dict, on_hand: Decimal | None = None) -> list[tuple[int, int, Decimal]]:
+def ledger_deltas(op: dict, lines: list[dict], on_hand: dict[int, Decimal] | None = None) -> list[tuple[int, int, Decimal]]:
     """(product_id, location_id, delta) rows an operation posts when it reaches 'done'.
 
-    An adjustment's qty is the counted quantity, so its delta is counted - on_hand (on_hand read under lock).
+    An adjustment line's qty is the counted quantity, so its delta is counted - on_hand (on_hand read under lock).
     Zero deltas are dropped. Sorted so every transaction locks quant rows in the same order: no deadlocks.
     """
-    qty, src, dst = op["qty"], op["source_location_id"], op["dest_location_id"]
-    if op["type"] == "adjustment":
-        moves = [(src, qty - on_hand)]
-    else:
-        moves = {
-            "receive": [(dst, qty)],
-            "transfer": [(src, -qty), (dst, qty)],
-            "delivery": [(src, -qty)],
-        }[op["type"]]
-    return sorted((op["product_id"], loc, delta) for loc, delta in moves if delta != 0)
+    src, dst = op["source_location_id"], op["dest_location_id"]
+    rows = []
+    for line in lines:
+        product_id, qty = line["product_id"], line["qty"]
+        if op["type"] == "adjustment":
+            moves = [(src, qty - on_hand[product_id])]
+        else:
+            moves = {
+                "receive": [(dst, qty)],
+                "transfer": [(src, -qty), (dst, qty)],
+                "delivery": [(src, -qty)],
+            }[op["type"]]
+        rows += [(product_id, loc, delta) for loc, delta in moves if delta != 0]
+    return sorted(rows)
 
 
 def _require_manager_for_adjustment(op_type: str, actor: dict) -> None:
@@ -67,7 +74,7 @@ def recompute_quant(cur, product_id: int, location_id: int, delta: Decimal) -> N
     qty = lock_quant(cur, product_id, location_id)
     new_qty = qty + delta
     if new_qty < 0:
-        raise DomainError(409, "insufficient_stock", f"Only {qty} on hand at location {location_id}")
+        raise DomainError(409, "insufficient_stock", f"Only {qty} of product {product_id} on hand at location {location_id}")
     cur.execute(
         "UPDATE quants SET qty = %s WHERE product_id = %s AND location_id = %s",
         (new_qty, product_id, location_id),
@@ -84,8 +91,13 @@ def append_ledger_entry(cur, operation_id: int, product_id: int, location_id: in
 
 def post_to_ledger(cur, op: dict, actor_id: int) -> None:
     """Apply a 'done' operation: ledger rows + quants, in the caller's transaction."""
-    on_hand = lock_quant(cur, op["product_id"], op["source_location_id"]) if op["type"] == "adjustment" else None
-    for product_id, location_id, delta in ledger_deltas(op, on_hand):
+    lines = cur.execute(
+        "SELECT product_id, qty FROM operation_lines WHERE operation_id = %s ORDER BY product_id", (op["id"],)
+    ).fetchall()
+    on_hand = None
+    if op["type"] == "adjustment":  # product order = the same lock order ledger_deltas sorts into
+        on_hand = {line["product_id"]: lock_quant(cur, line["product_id"], op["source_location_id"]) for line in lines}
+    for product_id, location_id, delta in ledger_deltas(op, lines, on_hand):
         recompute_quant(cur, product_id, location_id, delta)  # raises -> whole transaction rolls back
         append_ledger_entry(cur, op["id"], product_id, location_id, delta, actor_id)
 
@@ -125,6 +137,66 @@ def store_idempotent_response(cur, user_id: int, key: str | None, response: dict
 
 # --- operation services ---
 
+OP_SELECT = "SELECT o.*, u.login_id AS responsible FROM operations o JOIN users u ON u.id = o.created_by"
+
+
+def _has_line(cond: str) -> str:
+    """SQL: operation o has a line whose product p matches cond."""
+    return ("EXISTS (SELECT 1 FROM operation_lines l JOIN products p ON p.id = l.product_id "
+            f"WHERE l.operation_id = o.id AND {cond})")
+
+
+def _load(cur, clause: str = "", params: list | tuple = (), tail: str = "") -> list[OperationOut]:
+    """Operations matching clause, each with its lines and responsible user."""
+    ops = cur.execute(f"{OP_SELECT} {clause} {tail}", params).fetchall()
+    lines = defaultdict(list)
+    for line in cur.execute(
+        "SELECT l.operation_id, l.product_id, p.sku, p.name AS product_name, p.uom, l.qty "
+        "FROM operation_lines l JOIN products p ON p.id = l.product_id WHERE l.operation_id = ANY(%s) ORDER BY l.id",
+        ([o["id"] for o in ops],),
+    ).fetchall():
+        lines[line["operation_id"]].append(line)
+    return [OperationOut.model_validate({**o, "lines": lines[o["id"]]}) for o in ops]
+
+
+def _load_one(cur, op_id: int) -> OperationOut:
+    found = _load(cur, "WHERE o.id = %s", (op_id,))
+    if not found:
+        raise DomainError(404, "not_found", f"Operation {op_id} not found")
+    return found[0]
+
+
+def _insert_operation(cur, data: OperationIn, actor: dict, status: str = "draft") -> dict:
+    home = data.dest_location_id if data.type == "receive" else data.source_location_id
+    # Locking the warehouse row serializes reference numbering (count + 1) within that warehouse.
+    loc = cur.execute(
+        "SELECT l.warehouse_id FROM locations l JOIN warehouses w ON w.id = l.warehouse_id WHERE l.id = %s FOR UPDATE OF w",
+        (home,),
+    ).fetchone()
+    if not loc:
+        raise DomainError(422, "unknown_location", f"Location {home} does not exist")
+    row = cur.execute(
+        "INSERT INTO operations (reference, type, status, source_location_id, dest_location_id, warehouse_id, "
+        "scheduled_date, partner, delivery_address, note, created_by) VALUES ("
+        "op_reference((SELECT short_code FROM warehouses WHERE id = %(wh)s), %(type)s, "
+        "(SELECT count(*) + 1 FROM operations WHERE warehouse_id = %(wh)s AND type = %(type)s)), "
+        "%(type)s, %(status)s, %(src)s, %(dst)s, %(wh)s, COALESCE(%(date)s, current_date), %(partner)s, %(addr)s, "
+        "%(note)s, %(actor)s) RETURNING *",
+        {"wh": loc["warehouse_id"], "type": data.type, "status": status, "src": data.source_location_id,
+         "dst": data.dest_location_id, "date": data.scheduled_date, "partner": data.partner,
+         "addr": data.delivery_address, "note": data.note, "actor": actor["id"]},
+    ).fetchone()
+    cur.executemany(
+        "INSERT INTO operation_lines (operation_id, product_id, qty) VALUES (%s, %s, %s)",
+        [(row["id"], line.product_id, line.qty) for line in data.lines],
+    )
+    cur.execute(
+        "INSERT INTO operation_transitions (operation_id, from_status, to_status, actor_id) VALUES (%s, NULL, %s, %s)",
+        (row["id"], status, actor["id"]),
+    )
+    return row
+
+
 def create_operation(data: OperationIn, actor: dict, idempotency_key: str | None = None) -> tuple[OperationOut, bool]:
     """Returns (operation, created). created=False means an idempotent replay."""
     _require_manager_for_adjustment(data.type, actor)
@@ -133,22 +205,7 @@ def create_operation(data: OperationIn, actor: dict, idempotency_key: str | None
         replay = claim_idempotency_key(cur, actor["id"], idempotency_key, fingerprint)
         if replay is not None:
             return OperationOut.model_validate(replay), False
-        home = data.dest_location_id if data.type == "receive" else data.source_location_id
-        loc = cur.execute("SELECT warehouse_id FROM locations WHERE id = %s", (home,)).fetchone()
-        if not loc:
-            raise DomainError(422, "unknown_location", f"Location {home} does not exist")
-        row = cur.execute(
-            "INSERT INTO operations (type, product_id, qty, source_location_id, dest_location_id, warehouse_id, "
-            "scheduled_date, partner, note, created_by) "
-            "VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, current_date), %s, %s, %s) RETURNING *",
-            (data.type, data.product_id, data.qty, data.source_location_id, data.dest_location_id,
-             loc["warehouse_id"], data.scheduled_date, data.partner, data.note, actor["id"]),
-        ).fetchone()
-        cur.execute(
-            "INSERT INTO operation_transitions (operation_id, from_status, to_status, actor_id) VALUES (%s, NULL, 'draft', %s)",
-            (row["id"], actor["id"]),
-        )
-        op = OperationOut.model_validate(row)
+        op = _load_one(cur, _insert_operation(cur, data, actor)["id"])
         store_idempotent_response(cur, actor["id"], idempotency_key, op.model_dump(mode="json"))
     return op, True
 
@@ -171,16 +228,16 @@ def transition_operation(
         _require_manager_for_adjustment(op["type"], actor)
         if op["status"] != frm:
             raise DomainError(409, "stale_state", f"Operation is '{op['status']}', not '{frm}'")
-        if not can_transition(frm, to):
+        if not can_transition(op["type"], frm, to):
             raise DomainError(409, "illegal_transition", f"Cannot move {frm} -> {to}; allowed: {frm} -> {NEXT.get(frm)}")
         if to == "done":
             post_to_ledger(cur, op, actor["id"])
-        row = cur.execute("UPDATE operations SET status = %s WHERE id = %s RETURNING *", (to, op_id)).fetchone()
+        cur.execute("UPDATE operations SET status = %s WHERE id = %s", (to, op_id))
         cur.execute(
             "INSERT INTO operation_transitions (operation_id, from_status, to_status, actor_id) VALUES (%s, %s, %s, %s)",
             (op_id, frm, to, actor["id"]),
         )
-        result = OperationOut.model_validate(row)
+        result = _load_one(cur, op_id)
         store_idempotent_response(cur, actor["id"], idempotency_key, result.model_dump(mode="json"))
     return result, True
 
@@ -190,35 +247,60 @@ def _search(q: str | None):
     return q and ("(p.sku ILIKE %s OR p.name ILIKE %s)", [f"%{q}%"] * 2)
 
 
+def _at_location(location_id: int | None):
+    return location_id is not None and ("%s IN (o.source_location_id, o.dest_location_id)", [location_id])
+
+
 def list_operations(
     type: str | None = None, status: str | None = None, warehouse_id: int | None = None,
     category: str | None = None, location_id: int | None = None, q: str | None = None, limit: int = 200,
 ) -> list[OperationOut]:
+    """q matches reference, partner (contact), or any line's SKU / product name."""
     clause, params = db.where(
-        {"o.type": type, "o.status": status, "o.warehouse_id": warehouse_id, "p.category": category},
-        location_id is not None and ("%s IN (o.source_location_id, o.dest_location_id)", [location_id]),
-        _search(q),
+        {"o.type": type, "o.status": status, "o.warehouse_id": warehouse_id},
+        _at_location(location_id),
+        category is not None and (_has_line("p.category = %s"), [category]),
+        q and (f"(o.reference ILIKE %s OR o.partner ILIKE %s OR {_has_line('(p.sku ILIKE %s OR p.name ILIKE %s)')})",
+               [f"%{q}%"] * 4),
     )
     with db.tx() as cur:
-        rows = cur.execute(
-            f"SELECT o.* FROM operations o JOIN products p ON p.id = o.product_id {clause} "
-            "ORDER BY o.scheduled_date, o.id LIMIT %s",
-            (*params, limit),
-        ).fetchall()
-    return [OperationOut.model_validate(r) for r in rows]
+        return _load(cur, clause, [*params, limit], "ORDER BY o.scheduled_date, o.id LIMIT %s")
 
 
 def get_operation(op_id: int) -> OperationDetail:
     with db.tx() as cur:
-        op = cur.execute("SELECT * FROM operations WHERE id = %s", (op_id,)).fetchone()
-        if not op:
-            raise DomainError(404, "not_found", f"Operation {op_id} not found")
+        op = _load_one(cur, op_id)
         transitions = cur.execute(
             "SELECT from_status, to_status, actor_id, at FROM operation_transitions WHERE operation_id = %s ORDER BY id",
             (op_id,),
         ).fetchall()
         ledger = cur.execute("SELECT * FROM ledger WHERE operation_id = %s ORDER BY id", (op_id,)).fetchall()
-    return OperationDetail.model_validate({**op, "transitions": transitions, "ledger": ledger})
+    return OperationDetail.model_validate({**op.model_dump(), "transitions": transitions, "ledger": ledger})
+
+
+def list_moves(
+    type: str | None = None, status: str | None = None, warehouse_id: int | None = None, location_id: int | None = None,
+    product_id: int | None = None, q: str | None = None, limit: int = 500,
+) -> list[MoveOut]:
+    """Move History: one row per operation line. q matches reference, partner, SKU or product name."""
+    clause, params = db.where(
+        {"o.type": type, "o.status": status, "o.warehouse_id": warehouse_id, "l.product_id": product_id},
+        _at_location(location_id),
+        q and ("(o.reference ILIKE %s OR o.partner ILIKE %s OR p.sku ILIKE %s OR p.name ILIKE %s)", [f"%{q}%"] * 4),
+    )
+    with db.tx() as cur:
+        rows = cur.execute(
+            "SELECT o.id AS operation_id, o.reference, o.type, o.status, o.scheduled_date, o.partner, l.product_id, "
+            "p.sku, p.name AS product_name, p.uom, l.qty, "
+            "CASE WHEN o.type = 'receive' THEN o.partner ELSE src.name END AS from_location, "
+            "CASE WHEN o.type = 'delivery' THEN o.partner ELSE dst.name END AS to_location "
+            "FROM operation_lines l JOIN operations o ON o.id = l.operation_id JOIN products p ON p.id = l.product_id "
+            "LEFT JOIN locations src ON src.id = o.source_location_id "
+            "LEFT JOIN locations dst ON dst.id = o.dest_location_id "
+            f"{clause} ORDER BY o.scheduled_date DESC, o.id DESC, l.id LIMIT %s",
+            (*params, limit),
+        ).fetchall()
+    return [MoveOut.model_validate(r) for r in rows]
 
 
 def list_quants(warehouse_id: int | None = None, product_id: int | None = None, category: str | None = None,
@@ -229,8 +311,11 @@ def list_quants(warehouse_id: int | None = None, product_id: int | None = None, 
     )
     with db.tx() as cur:
         rows = cur.execute(
-            "SELECT q.product_id, p.sku, p.name AS product_name, p.category, p.uom, q.location_id, "
-            "l.name AS location_name, l.warehouse_id, q.qty "
+            "SELECT q.product_id, p.sku, p.name AS product_name, p.category, p.uom, p.unit_cost, q.location_id, "
+            "l.name AS location_name, l.warehouse_id, q.qty, q.qty - COALESCE(("
+            "SELECT SUM(ol.qty) FROM operation_lines ol JOIN operations o ON o.id = ol.operation_id "
+            "WHERE ol.product_id = q.product_id AND o.source_location_id = q.location_id "
+            "AND o.type IN ('delivery', 'transfer') AND o.status NOT IN ('done', 'canceled')), 0) AS free_qty "
             "FROM quants q JOIN products p ON p.id = q.product_id JOIN locations l ON l.id = q.location_id "
             f"{clause} ORDER BY p.sku, l.name",
             params,
@@ -242,23 +327,14 @@ def create_product(data: ProductIn, actor: dict) -> dict:
     """Insert a product; optional initial stock is posted as a done adjustment so quants still equal SUM(ledger)."""
     with db.tx() as cur:
         product = cur.execute(
-            "INSERT INTO products (sku, name, category, uom, min_qty) VALUES (%s, %s, %s, %s, %s) RETURNING *",
-            (data.sku, data.name, data.category, data.uom, data.min_qty),
+            "INSERT INTO products (sku, name, category, uom, min_qty, unit_cost) VALUES (%s, %s, %s, %s, %s, %s) "
+            "RETURNING *",
+            (data.sku, data.name, data.category, data.uom, data.min_qty, data.unit_cost),
         ).fetchone()
         if data.initial_qty > 0:
-            loc = cur.execute("SELECT warehouse_id FROM locations WHERE id = %s", (data.initial_location_id,)).fetchone()
-            if not loc:
-                raise DomainError(422, "unknown_location", f"Location {data.initial_location_id} does not exist")
-            op = cur.execute(
-                "INSERT INTO operations (type, status, product_id, qty, source_location_id, warehouse_id, note, created_by) "
-                "VALUES ('adjustment', 'done', %s, %s, %s, %s, 'Initial stock', %s) RETURNING *",
-                (product["id"], data.initial_qty, data.initial_location_id, loc["warehouse_id"], actor["id"]),
-            ).fetchone()
-            cur.execute(
-                "INSERT INTO operation_transitions (operation_id, from_status, to_status, actor_id) VALUES (%s, NULL, 'done', %s)",
-                (op["id"], actor["id"]),
-            )
-            post_to_ledger(cur, op, actor["id"])
+            count = OperationIn(type="adjustment", lines=[LineIn(product_id=product["id"], qty=data.initial_qty)],
+                                source_location_id=data.initial_location_id, note="Initial stock")
+            post_to_ledger(cur, _insert_operation(cur, count, actor, status="done"), actor["id"])
     return product
 
 
@@ -285,19 +361,25 @@ def dashboard(warehouse_id: int | None = None, category: str | None = None) -> D
             "WHERE %(cat)s::text IS NULL OR p.category = %(cat)s GROUP BY p.id ORDER BY p.sku",
             {"wh": warehouse_id, "cat": category},
         ).fetchall()
-        clause, params = db.where({"o.warehouse_id": warehouse_id, "p.category": category},
-                                  ("o.status NOT IN ('done', 'canceled')", []))
-        pending = {r["type"]: r["n"] for r in cur.execute(
-            f"SELECT o.type, count(*) AS n FROM operations o JOIN products p ON p.id = o.product_id {clause} GROUP BY o.type",
+        clause, params = db.where({"o.warehouse_id": warehouse_id},
+                                  category is not None and (_has_line("p.category = %s"), [category]))
+        counts = {r["type"]: OpCounts.model_validate(r) for r in cur.execute(
+            "SELECT o.type, "
+            "count(*) FILTER (WHERE o.status NOT IN ('done', 'canceled')) AS open, "
+            "count(*) FILTER (WHERE o.status = 'ready') AS ready, "
+            "count(*) FILTER (WHERE o.status = 'waiting') AS waiting, "
+            "count(*) FILTER (WHERE o.status NOT IN ('done', 'canceled') AND o.scheduled_date < current_date) AS late, "
+            "count(*) FILTER (WHERE o.status NOT IN ('done', 'canceled') AND o.scheduled_date > current_date) AS upcoming "
+            f"FROM operations o {clause} GROUP BY o.type",
             params,
         ).fetchall()}
     return DashboardOut(
         products_in_stock=sum(r["on_hand"] > 0 for r in stock),
         low_stock=sum(0 < r["on_hand"] <= r["min_qty"] for r in stock),
         out_of_stock=sum(r["on_hand"] == 0 for r in stock),
-        pending_receipts=pending.get("receive", 0),
-        pending_deliveries=pending.get("delivery", 0),
-        scheduled_transfers=pending.get("transfer", 0),
+        receipts=counts.get("receive", OpCounts()),
+        deliveries=counts.get("delivery", OpCounts()),
+        transfers=counts.get("transfer", OpCounts()),
         alerts=[StockAlert.model_validate(r) for r in stock if r["on_hand"] <= r["min_qty"]],
     )
 
@@ -328,7 +410,7 @@ def get_warehouses(_: dict = Depends(current_user)):
 
 @router.post("/warehouses", status_code=201, response_model=WarehouseOut)
 def post_warehouse(body: WarehouseIn, _: dict = Depends(manager_only)):
-    return _insert("warehouses", ("name",), (body.name,))
+    return _insert("warehouses", ("name", "short_code", "address"), (body.name, body.short_code, body.address))
 
 
 @router.get("/locations", response_model=list[LocationOut])
@@ -339,7 +421,7 @@ def get_locations(warehouse_id: int | None = None, _: dict = Depends(current_use
 
 @router.post("/locations", status_code=201, response_model=LocationOut)
 def post_location(body: LocationIn, _: dict = Depends(manager_only)):
-    return _insert("locations", ("warehouse_id", "name"), (body.warehouse_id, body.name))
+    return _insert("locations", ("warehouse_id", "name", "short_code"), (body.warehouse_id, body.name, body.short_code))
 
 
 @router.get("/dashboard", response_model=DashboardOut)
@@ -397,6 +479,13 @@ def post_transition(op_id: int, body: TransitionIn, user: dict = Depends(any_rol
     if changed:
         publish({"type": "operation.transitioned", "operationId": op.id, "newState": op.status})
     return op
+
+
+@router.get("/moves", response_model=list[MoveOut])
+def get_moves(type: OpType | None = None, status: OpStatus | None = None, warehouse_id: int | None = None,
+              location_id: int | None = None, product_id: int | None = None, q: str | None = None,
+              limit: int = Query(500, ge=1, le=5000), _: dict = Depends(current_user)):
+    return list_moves(type, status, warehouse_id, location_id, product_id, q, limit)
 
 
 @router.get("/ledger", response_model=list[LedgerOut])

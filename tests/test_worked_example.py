@@ -7,12 +7,11 @@ import pytest
 from app import db
 from app.db import DomainError
 from app.inventory import create_operation, transition_operation
-from app.schemas import OperationIn
-from tests.conftest import assert_quants_match_ledger, quant
+from tests.conftest import assert_quants_match_ledger, op_in, quant
 
 
 def validate(actor: dict, **fields) -> int:
-    op, _ = create_operation(OperationIn(**fields), actor)
+    op, _ = create_operation(op_in(**fields), actor)
     for frm, to in [("draft", "waiting"), ("waiting", "ready"), ("ready", "done")]:
         transition_operation(op.id, frm, to, actor, uuid.uuid4().hex)
     return op.id
@@ -48,7 +47,7 @@ def test_ledger_is_append_only(world):
 
 def test_failed_validation_rolls_back_everything(world):
     m = world["manager"]
-    op, _ = create_operation(OperationIn(type="delivery", product_id=world["steel"], qty=5,
+    op, _ = create_operation(op_in(type="delivery", product_id=world["steel"], qty=5,
                                          source_location_id=world["stock"]), m)
     transition_operation(op.id, "draft", "waiting", m, None)
     transition_operation(op.id, "waiting", "ready", m, None)
@@ -62,7 +61,7 @@ def test_failed_validation_rolls_back_everything(world):
 
 def test_backward_and_skip_transitions_rejected(world):
     m = world["manager"]
-    op, _ = create_operation(OperationIn(type="receive", product_id=world["steel"], qty=1,
+    op, _ = create_operation(op_in(type="receive", product_id=world["steel"], qty=1,
                                          dest_location_id=world["stock"]), m)
     with pytest.raises(DomainError) as e:
         transition_operation(op.id, "draft", "done", m, None)
@@ -75,7 +74,7 @@ def test_backward_and_skip_transitions_rejected(world):
 
 def test_staff_cannot_adjust(world):
     with pytest.raises(DomainError) as e:
-        create_operation(OperationIn(type="adjustment", product_id=world["steel"], qty=1,
+        create_operation(op_in(type="adjustment", product_id=world["steel"], qty=1,
                                      source_location_id=world["stock"]), world["staff"])
     assert e.value.status == 403
 
@@ -87,7 +86,7 @@ def test_count_adjustment_can_add_stock_and_cancel_never_posts(world):
     validate(m, type="adjustment", product_id=steel, qty=0, source_location_id=stock)  # all gone
     assert quant(steel, stock) == 0
 
-    op, _ = create_operation(OperationIn(type="receive", product_id=steel, qty=5, dest_location_id=stock), m)
+    op, _ = create_operation(op_in(type="receive", product_id=steel, qty=5, dest_location_id=stock), m)
     transition_operation(op.id, "draft", "canceled", m, None)
     with pytest.raises(DomainError) as e:
         transition_operation(op.id, "canceled", "done", m, None)

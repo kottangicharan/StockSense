@@ -6,12 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 from app import db
 from app.db import DomainError
 from app.inventory import create_operation, transition_operation
-from app.schemas import OperationIn
-from tests.conftest import assert_quants_match_ledger, quant
+from tests.conftest import assert_quants_match_ledger, op_in, quant
 
 
 def to_ready(actor, **fields) -> int:
-    op, _ = create_operation(OperationIn(**fields), actor)
+    op, _ = create_operation(op_in(**fields), actor)
     transition_operation(op.id, "draft", "waiting", actor, None)
     transition_operation(op.id, "waiting", "ready", actor, None)
     return op.id

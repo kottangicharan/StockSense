@@ -38,7 +38,7 @@ The schema is applied idempotently on boot, so there's no separate migration ste
 |---|---|
 | `ledger` | Append-only. One row per stock movement, written when an operation reaches `done`. A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE`. |
 | `quants` | Current on-hand quantity per product and location. Every read uses this table, so a lookup is O(1). It's updated **in the same transaction** as the ledger insert, after `SELECT … FOR UPDATE` locks the row. `CHECK (qty >= 0)` is a second line of defence. |
-| `operations` / `operation_transitions` | The state machine, draft → waiting → ready → done, or any open state → canceled. It only moves forward, one step at a time. Every move records the actor and a timestamp, and the transitions table is append-only. Operations can never be deleted. |
+| `operations` / `operation_transitions` | The state machine, draft → waiting → ready → done, or any open state → canceled. It only moves forward, one step at a time (receipts may skip waiting). Every move records the actor and a timestamp, and the transitions table is append-only. Operations can never be deleted. |
 | `idempotency_keys` | `POST /operations/{id}/transition` **requires** an `Idempotency-Key` header. A retry or double-click with the same key replays the first response and never runs the transition twice. |
 
 The spec's worked example is an acceptance test ([tests/test_worked_example.py](tests/test_worked_example.py)):
@@ -79,16 +79,40 @@ After each step, the test also checks that `quants` equals `SUM(ledger)`. [tests
 
 ## Inventory features
 
-- **Adjustments are physical counts.** The adjustment's `qty` is the counted quantity (0 allowed). When the adjustment is validated, it posts `counted − on_hand` to the ledger, with on_hand read under the row lock. A count that matches the recorded stock posts nothing.
-- **Products** have `uom` and `min_qty`, which is the reordering rule. `POST /products` accepts `initial_qty` + `initial_location_id` and posts the initial stock as a done adjustment, so it appears in the ledger. `PATCH /products/{id}` updates products and is manager-only.
-- **Receipts and deliveries** take an optional `partner` (the supplier or the customer).
+- **Operations have lines.** `POST /operations` takes `lines: [{product_id, qty}, ...]` (each product at most once), plus `partner` (the supplier or the customer), `delivery_address`, `scheduled_date` and `note`. Responses include:
+  - `lines`, where each line has `sku`, `product_name` and `uom`
+  - `reference`
+  - `responsible`, the creator's login
+- **References** look like `<warehouse short_code>/<IN|OUT|INT|ADJ>/0001`. They're numbered separately for each warehouse and operation type, and one SQL function (`op_reference`) builds them.
+- **Receipts may skip `waiting`**, so they can go draft → ready → done. Other operations still move one step at a time.
+- **Adjustments are physical counts.** Each line's `qty` is the counted quantity (0 allowed). When the adjustment is validated, it posts `counted − on_hand` to the ledger, with on_hand read under the row lock. A count that matches the recorded stock posts nothing.
+- **Warehouses** have `short_code` (required, no `/`) and `address`. **Locations** have `short_code`.
+- **Products** have:
+  - `uom`
+  - `unit_cost`
+  - `min_qty`, the reordering rule
+  - `POST /products` accepts `initial_qty` + `initial_location_id`, and posts the initial stock as a done adjustment.
+  - `PATCH /products/{id}` updates products and is manager-only.
+- **`GET /quants`** returns `qty` (on hand) and `free_qty`. `free_qty` is on hand minus what open deliveries and transfers from that location will take. A negative value means more is promised than is in stock.
 - **`GET /dashboard?warehouse_id=&category=`** returns:
   - products in stock
-  - low-stock count (`0 < on_hand ≤ min_qty`)
-  - out-of-stock count
-  - pending receipts, deliveries and transfers (not done or canceled)
+  - the low-stock count (`0 < on_hand ≤ min_qty`)
+  - the out-of-stock count
   - `alerts`, the list of every low or out-of-stock product
-- **Filters.** `/operations` takes `type`, `status`, `warehouse_id`, `location_id` (source or destination), `category` and `q`. `/quants` takes `warehouse_id`, `location_id`, `product_id`, `category` and `q`. `/products` takes `category` and `q`. `q` is a case-insensitive search on SKU or name.
+  - `receipts`, `deliveries` and `transfers`, each with these counts:
+    - `open`
+    - `ready` ("to receive", "to deliver")
+    - `waiting`
+    - `late` (scheduled before today)
+    - `upcoming` (scheduled after today)
+- **`GET /moves`** is Move History, and any logged-in user can read it. It returns one row per operation line with the reference, status, date, product, qty, and `from_location` / `to_location`. For a receipt, `from_location` is the supplier; for a delivery, `to_location` is the customer. `/ledger` still returns the raw signed deltas and is manager-only.
+- **Filters and search.**
+  - `/operations` takes `type`, `status`, `warehouse_id`, `location_id` (source or destination), `category` and `q`. `q` matches the reference, the partner, or any line's SKU or name.
+  - `/moves` takes `type`, `status`, `warehouse_id`, `location_id`, `product_id` and `q`.
+  - `/quants` takes `warehouse_id`, `location_id`, `product_id`, `category` and `q`.
+  - `/products` takes `category` and `q`.
+  - `q` is a case-insensitive search on SKU or name unless stated otherwise.
+- Databases from before operation lines existed are migrated in place on boot. Existing `product_id`/`qty` values become lines, and existing warehouses get the short code `WH<id>`.
 
 ## Realtime
 
@@ -103,4 +127,3 @@ Connect to `GET /ws`; the access cookie authenticates it. After a write **commit
 ## Known limits (deliberate, for a single-instance demo)
 
 - Rate limits and the WebSocket client registry live in process memory. That's correct for one API instance. If you scale out, move them to Postgres or Redis and `LISTEN/NOTIFY`.
-- Each operation covers one product. Multi-line pickings aren't implemented.
