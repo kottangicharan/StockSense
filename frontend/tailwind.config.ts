@@ -1,17 +1,20 @@
 import type { Config } from 'tailwindcss';
 
-// Palette carried over from legacy/index.html (dark navy surfaces, red accent).
+// Palette carried over from legacy/index.html. Values live as RGB channels in globals.css
+// (dark default, light under [data-theme='light']) so opacity modifiers like bg-ok/15 still work.
+const v = (name: string) => `rgb(var(--${name}) / <alpha-value>)`;
+
 export default {
   content: ['./src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
-        bg: '#0d0d0f',
-        s0: '#111116', s1: '#16161d', s2: '#1c1c26', s3: '#22222e', s4: '#2a2a38',
-        b1: '#1e1e2a', b2: '#26263a', b3: '#30304a',
-        accent: { DEFAULT: '#e03a3a', soft: '#c0322b' },
-        info: '#3d8ef0', ok: '#2dc98d', warn: '#f5a623', violet: '#a78bfa',
-        t1: '#f0f0f8', t2: '#b0b0c8', t3: '#6a6a88', t4: '#3a3a52',
+        bg: v('bg'),
+        s0: v('s0'), s1: v('s1'), s2: v('s2'), s3: v('s3'), s4: v('s4'),
+        b1: v('b1'), b2: v('b2'), b3: v('b3'),
+        accent: { DEFAULT: v('accent'), soft: v('accent-soft') },
+        info: v('info'), ok: v('ok'), warn: v('warn'), violet: v('violet'),
+        t1: v('t1'), t2: v('t2'), t3: v('t3'), t4: v('t4'),
       },
       fontFamily: { sans: ['var(--font-inter)', 'system-ui', 'sans-serif'], mono: ['ui-monospace', 'monospace'] },
     },

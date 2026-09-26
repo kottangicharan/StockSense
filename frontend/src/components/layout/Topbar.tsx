@@ -1,7 +1,8 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { IconLogout, IconMenu2 } from '@tabler/icons-react';
+import { IconLogout, IconMenu2, IconMoon, IconSun } from '@tabler/icons-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { useLive } from '@/contexts/WebSocketContext';
 import { NAV } from './Sidebar';
@@ -11,6 +12,15 @@ export function Topbar({ onMenu }: { onMenu: () => void }) {
   const { connected } = useLive();
   const router = useRouter();
   const pathname = usePathname();
+  const [light, setLight] = useState(false);
+  useEffect(() => setLight(document.documentElement.dataset.theme === 'light'), []);
+  const toggleTheme = () => {
+    const next = !light;
+    setLight(next);
+    if (next) document.documentElement.dataset.theme = 'light';
+    else delete document.documentElement.dataset.theme;
+    try { localStorage.setItem('theme', next ? 'light' : 'dark'); } catch {}
+  };
   const title = NAV.find((n) => pathname.startsWith(n.href))?.label ?? '';
 
   return (
@@ -27,6 +37,14 @@ export function Topbar({ onMenu }: { onMenu: () => void }) {
         <span className="hidden text-t2 sm:inline">
           {user?.login_id} <span className="rounded bg-s3 px-1.5 py-0.5 text-xs capitalize text-t3">{user?.role}</span>
         </span>
+        <button
+          onClick={toggleTheme}
+          aria-label={light ? 'Switch to dark mode' : 'Switch to light mode'}
+          title={light ? 'Dark mode' : 'Light mode'}
+          className="rounded p-1.5 text-t2 hover:bg-s3 hover:text-t1"
+        >
+          {light ? <IconMoon size={18} /> : <IconSun size={18} />}
+        </button>
         <button
           onClick={async () => { await logout(); router.replace('/login'); }}
           aria-label="Log out"

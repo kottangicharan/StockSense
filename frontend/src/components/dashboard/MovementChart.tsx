@@ -9,8 +9,8 @@ import type { Move } from '@/lib/types';
 
 // Validated against the dark surface (dataviz validator). Red/green is weak under deuteranopia,
 // so "Out" is also dashed and the legend is always shown.
-const IN = '#1fa874';
-const OUT = '#e03a3a';
+const IN = 'rgb(var(--ok))';
+const OUT = 'rgb(var(--accent))';
 
 /** Daily quantity received vs delivered, from done moves (/moves is readable by every role; /ledger is manager-only). */
 export function MovementChart({ warehouseId = '' }: { warehouseId?: string }) {
@@ -24,7 +24,18 @@ export function MovementChart({ warehouseId = '' }: { warehouseId?: string }) {
       if (m.type === 'receive') d.in += m.qty; else d.out += m.qty;
       byDay.set(m.scheduled_date, d);
     }
-    return [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
+    if (!byDay.size) return [];
+    // Zero-fill a continuous range (at least the last 14 days) so a single active day still draws a line.
+    // ponytail: range grows with the oldest move; clamp to a window if history gets long.
+    const iso = (t: number) => new Date(t).toISOString().slice(0, 10);
+    const DAY = 86_400_000;
+    const days = [...byDay.keys()].sort();
+    const today = Date.parse(new Date().toISOString().slice(0, 10));
+    const start = Math.min(Date.parse(days[0]), today - 13 * DAY);
+    const end = Math.max(Date.parse(days[days.length - 1]), today);
+    const out = [];
+    for (let t = start; t <= end; t += DAY) out.push(byDay.get(iso(t)) ?? { day: iso(t), in: 0, out: 0 });
+    return out;
   }, [data]);
 
   return (
@@ -45,16 +56,16 @@ export function MovementChart({ warehouseId = '' }: { warehouseId?: string }) {
                     <stop offset="0%" stopColor={OUT} stopOpacity={0.2} /><stop offset="100%" stopColor={OUT} stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid stroke="#1e1e2a" vertical={false} />
-                <XAxis dataKey="day" tickFormatter={fmtDate} stroke="#6a6a88" fontSize={11} tickLine={false} axisLine={false} />
-                <YAxis stroke="#6a6a88" fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtQty} />
+                <CartesianGrid stroke="rgb(var(--b1))" vertical={false} />
+                <XAxis dataKey="day" tickFormatter={fmtDate} stroke="rgb(var(--t3))" fontSize={11} tickLine={false} axisLine={false} />
+                <YAxis stroke="rgb(var(--t3))" fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtQty} />
                 <Tooltip
-                  cursor={{ stroke: '#30304a' }}
-                  contentStyle={{ background: '#1c1c26', border: '1px solid #30304a', borderRadius: 8, fontSize: 12, color: '#f0f0f8' }}
+                  cursor={{ stroke: 'rgb(var(--b3))' }}
+                  contentStyle={{ background: 'rgb(var(--s2))', border: '1px solid rgb(var(--b3))', borderRadius: 8, fontSize: 12, color: 'rgb(var(--t1))' }}
                   labelFormatter={(d) => fmtDate(String(d))}
                   formatter={(v, name) => [fmtQty(Number(v)), name]}
                 />
-                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: '#b0b0c8' }} />
+                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: 'rgb(var(--t2))' }} />
                 <Area type="monotone" dataKey="in" name="Received" stroke={IN} strokeWidth={2} fill="url(#gIn)" dot={{ r: 3 }} activeDot={{ r: 5 }} />
                 <Area type="monotone" dataKey="out" name="Delivered" stroke={OUT} strokeWidth={2} strokeDasharray="5 3" fill="url(#gOut)" dot={{ r: 3 }} activeDot={{ r: 5 }} />
               </AreaChart>
